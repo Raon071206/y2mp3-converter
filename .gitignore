@@ -1,0 +1,16 @@
+# Virtual environment & caches
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# User runtime config
+config.json
+
+# Large FFmpeg binaries (exceed GitHub 100MB file limit; bundle via Releases)
+bin/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
