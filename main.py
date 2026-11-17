@@ -16,15 +16,15 @@ from typing import Iterator, Optional
 import customtkinter as ctk
 
 from converter import (
+    AudioExtractor,
+    AudioTrimmer,
     ConversionOptions,
     LOSSLESS_FORMATS,
     LocalCutOptions,
     ProgressEvent,
     THUMBNAIL_SUPPORTED_FORMATS,
+    ThumbnailExtractor,
     ThumbnailOptions,
-    convert_to_mp3,
-    cut_local_audio,
-    extract_thumbnail,
     find_ffmpeg_dir,
     format_seconds_ms,
     get_app_dir,
@@ -707,7 +707,7 @@ class Y2MP3App(ctk.CTk):
                 start_time=self._start_time_var.get(),
                 end_time=self._end_time_var.get(),
             )
-            target_fn = convert_to_mp3
+            processor = AudioExtractor(self._event_queue.put, self._cancel_event)
         elif mode == "썸네일 추출":
             options = ThumbnailOptions(
                 urls=urls,
@@ -715,7 +715,7 @@ class Y2MP3App(ctk.CTk):
                 quality=THUMB_QUALITY_MAP.get(self._thumb_quality_var.get(), "best"),
                 allow_playlist=self._thumb_playlist_var.get(),
             )
-            target_fn = extract_thumbnail
+            processor = ThumbnailExtractor(self._event_queue.put, self._cancel_event)
         else:
             options = LocalCutOptions(
                 source_file=Path(self._cut_file_var.get().strip()),
@@ -724,11 +724,11 @@ class Y2MP3App(ctk.CTk):
                 end_time=self._cut_end_var.get(),
                 max_duration=self._cut_max_duration,
             )
-            target_fn = cut_local_audio
+            processor = AudioTrimmer(self._event_queue.put, self._cancel_event)
 
         self._worker = threading.Thread(
-            target=target_fn,
-            args=(options, self._event_queue.put, self._cancel_event),
+            target=processor.run,
+            args=(options,),
             daemon=True,
         )
         self._worker.start()

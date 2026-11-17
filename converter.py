@@ -289,199 +289,239 @@ def _trim_audio_file(
     trimmed_path.replace(src_path)
 
 
-def convert_to_mp3(
-    options: ConversionOptions,
-    emit: Callable[[ProgressEvent], None],
-    cancel_event: threading.Event,
-) -> None:
-    """Download audio from one or more URLs and save as '<title>(<quality>).<ext>'."""
-    urls = [u.strip() for u in options.urls if u.strip()]
-    if not urls:
-        emit(ProgressEvent(kind="error", message="URL을 하나 이상 입력해 주세요."))
-        return
+class BaseMediaProcessor:
+    """Base class for media extraction and processing workers."""
 
-    invalid = [u for u in urls if not detect_platform(u)]
-    if invalid:
-        emit(
+    def __init__(
+        self,
+        emit: Callable[[ProgressEvent], None],
+        cancel_event: threading.Event,
+    ) -> None:
+        self._emit_cb = emit
+        self._cancel_event = cancel_event
+
+    def _emit(
+        self,
+        kind: str,
+        message: str,
+        percent: float = 0.0,
+        title: str = "",
+        speed_text: str = "",
+        eta_text: str = "",
+    ) -> None:
+        self._emit_cb(
             ProgressEvent(
-                kind="error",
-                message=f"지원하지 않는 URL이 있습니다: {invalid[0]}",
+                kind=kind,
+                message=message,
+                percent=percent,
+                title=title,
+                speed_text=speed_text,
+                eta_text=eta_text,
             )
         )
-        return
 
-    try:
-        start_sec = parse_time_to_seconds(options.start_time)
-        end_sec = parse_time_to_seconds(options.end_time)
-        if start_sec is not None and end_sec is not None and start_sec >= end_sec:
-            emit(ProgressEvent(kind="error", message="종료 시간은 시작 시간보다 커야 합니다."))
-            return
-    except ValueError as exc:
-        emit(ProgressEvent(kind="error", message=str(exc)))
-        return
+    def _is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
 
-    ffmpeg_dir = find_ffmpeg_dir()
-    if ffmpeg_dir is None:
-        emit(
-            ProgressEvent(
-                kind="error",
-                message="FFmpeg을 찾을 수 없습니다. bin 폴더 또는 시스템 PATH를 확인해 주세요.",
+    def _validate_urls(self, raw_urls: list[str]) -> Optional[list[str]]:
+        urls = [u.strip() for u in raw_urls if u.strip()]
+        if not urls:
+            self._emit("error", "URL을 하나 이상 입력해 주세요.")
+            return None
+        invalid = [u for u in urls if not detect_platform(u)]
+        if invalid:
+            self._emit("error", f"지원하지 않는 URL이 있습니다: {invalid[0]}")
+            return None
+        return urls
+
+    def _require_ffmpeg(self) -> Optional[Path]:
+        ffmpeg_dir = find_ffmpeg_dir()
+        if ffmpeg_dir is None:
+            self._emit(
+                "error",
+                "FFmpeg을 찾을 수 없습니다. bin 폴더 또는 시스템 PATH를 확인해 주세요.",
             )
-        )
-        return
+        return ffmpeg_dir
 
-    options.output_dir.mkdir(parents=True, exist_ok=True)
-    fmt = options.audio_format.lower()
-    use_embed_thumb = options.embed_thumbnail and (fmt in THUMBNAIL_SUPPORTED_FORMATS)
-    quality_tag = _quality_label(fmt, options.bitrate)
-    need_trim = start_sec is not None or end_sec is not None
 
-    total_urls = len(urls)
-    saved_count = 0
+class AudioExtractor(BaseMediaProcessor):
+    """Downloads audio streams from YouTube/SoundCloud and encodes/trims them."""
 
-    for url_idx, url in enumerate(urls, start=1):
-        if cancel_event.is_set():
-            emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
+    def run(self, options: ConversionOptions) -> None:
+        """Execute audio extraction for one or more URLs."""
+        urls = self._validate_urls(options.urls)
+        if urls is None:
             return
 
-        platform = detect_platform(url)
-        prefix = f"[{url_idx}/{total_urls}] " if total_urls > 1 else ""
-        current_title = ""
-        last_reported_pct = -1.0
+        try:
+            start_sec = parse_time_to_seconds(options.start_time)
+            end_sec = parse_time_to_seconds(options.end_time)
+            if start_sec is not None and end_sec is not None and start_sec >= end_sec:
+                self._emit("error", "종료 시간은 시작 시간보다 커야 합니다.")
+                return
+        except ValueError as exc:
+            self._emit("error", str(exc))
+            return
 
-        def progress_hook(d: dict) -> None:
-            nonlocal current_title, last_reported_pct
-            if cancel_event.is_set():
-                raise DownloadCancelled("사용자가 작업을 취소했습니다.")
+        ffmpeg_dir = self._require_ffmpeg()
+        if ffmpeg_dir is None:
+            return
 
-            info = d.get("info_dict") or {}
-            if info.get("title"):
-                current_title = str(info["title"])
+        options.output_dir.mkdir(parents=True, exist_ok=True)
+        fmt = options.audio_format.lower()
+        use_embed_thumb = options.embed_thumbnail and (fmt in THUMBNAIL_SUPPORTED_FORMATS)
+        quality_tag = _quality_label(fmt, options.bitrate)
+        need_trim = start_sec is not None or end_sec is not None
 
-            status = d.get("status")
-            if status == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                downloaded = d.get("downloaded_bytes") or 0
-                pct = (downloaded / total) if total > 0 else 0.0
-                pct = max(0.0, min(1.0, pct))
+        total_urls = len(urls)
+        saved_count = 0
+        last_title = ""
 
-                if abs(pct - last_reported_pct) >= 0.01 or pct >= 0.999:
-                    last_reported_pct = pct
-                    overall = ((url_idx - 1) + pct * 0.85) / total_urls
-                    emit(
-                        ProgressEvent(
-                            kind="progress",
-                            message=f"{prefix}다운로드 중... ({pct * 100:.0f}%)",
+        for url_idx, url in enumerate(urls, start=1):
+            if self._is_cancelled():
+                self._emit("cancelled", "작업이 취소되었습니다.")
+                return
+
+            platform = detect_platform(url)
+            prefix = f"[{url_idx}/{total_urls}] " if total_urls > 1 else ""
+            current_title = ""
+            last_reported_pct = -1.0
+
+            def progress_hook(d: dict) -> None:
+                nonlocal current_title, last_reported_pct
+                if self._is_cancelled():
+                    raise DownloadCancelled("사용자가 작업을 취소했습니다.")
+
+                info = d.get("info_dict") or {}
+                if info.get("title"):
+                    current_title = str(info["title"])
+
+                status = d.get("status")
+                if status == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    downloaded = d.get("downloaded_bytes") or 0
+                    pct = (downloaded / total) if total > 0 else 0.0
+                    pct = max(0.0, min(1.0, pct))
+
+                    if abs(pct - last_reported_pct) >= 0.01 or pct >= 0.999:
+                        last_reported_pct = pct
+                        overall = ((url_idx - 1) + pct * 0.85) / total_urls
+                        self._emit(
+                            "progress",
+                            f"{prefix}다운로드 중... ({pct * 100:.0f}%)",
                             percent=overall,
                             title=current_title,
                             speed_text=_format_speed(d.get("speed")),
                             eta_text=_format_eta(d.get("eta")),
                         )
-                    )
-            elif status == "finished":
-                overall = ((url_idx - 1) + 0.88) / total_urls
-                emit(
-                    ProgressEvent(
-                        kind="status",
-                        message=f"{prefix}{fmt.upper()} 변환 중...",
+                elif status == "finished":
+                    overall = ((url_idx - 1) + 0.88) / total_urls
+                    self._emit(
+                        "status",
+                        f"{prefix}{fmt.upper()} 변환 중...",
                         percent=overall,
                         title=current_title,
                     )
+
+            def postprocessor_hook(d: dict) -> None:
+                if self._is_cancelled():
+                    raise DownloadCancelled("사용자가 작업을 취소했습니다.")
+
+            codec = "vorbis" if fmt == "ogg" else fmt
+            postprocessors: list[dict] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": codec,
+                    "preferredquality": "0" if fmt in LOSSLESS_FORMATS else options.bitrate,
+                }
+            ]
+            if use_embed_thumb:
+                postprocessors.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
+            if options.embed_metadata:
+                postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
+            if use_embed_thumb:
+                postprocessors.append(
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False}
                 )
 
-        def postprocessor_hook(d: dict) -> None:
-            if cancel_event.is_set():
-                raise DownloadCancelled("사용자가 작업을 취소했습니다.")
+            with tempfile.TemporaryDirectory(prefix="y2mp3_") as tmp_dir_str:
+                tmp_dir = Path(tmp_dir_str)
+                ydl_opts: dict = {
+                    "format": "bestaudio/best",
+                    "outtmpl": os.path.join(tmp_dir_str, "%(title)s.%(ext)s"),
+                    "ffmpeg_location": str(ffmpeg_dir),
+                    "noplaylist": not options.allow_playlist,
+                    "writethumbnail": use_embed_thumb,
+                    "concurrent_fragment_downloads": options.concurrent_fragments,
+                    "postprocessors": postprocessors,
+                    "progress_hooks": [progress_hook],
+                    "postprocessor_hooks": [postprocessor_hook],
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noprogress": True,
+                    "retries": 3,
+                    "fragment_retries": 3,
+                }
 
-        codec = "vorbis" if fmt == "ogg" else fmt
-        postprocessors: list[dict] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": codec,
-                "preferredquality": "0" if fmt in LOSSLESS_FORMATS else options.bitrate,
-            }
-        ]
-        if use_embed_thumb:
-            postprocessors.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg"})
-        if options.embed_metadata:
-            postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
-        if use_embed_thumb:
-            postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
-
-        with tempfile.TemporaryDirectory(prefix="y2mp3_") as tmp_dir_str:
-            tmp_dir = Path(tmp_dir_str)
-            ydl_opts: dict = {
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(tmp_dir_str, "%(title)s.%(ext)s"),
-                "ffmpeg_location": str(ffmpeg_dir),
-                "noplaylist": not options.allow_playlist,
-                "writethumbnail": use_embed_thumb,
-                "concurrent_fragment_downloads": options.concurrent_fragments,
-                "postprocessors": postprocessors,
-                "progress_hooks": [progress_hook],
-                "postprocessor_hooks": [postprocessor_hook],
-                "quiet": True,
-                "no_warnings": True,
-                "noprogress": True,
-                "retries": 3,
-                "fragment_retries": 3,
-            }
-
-            try:
-                emit(
-                    ProgressEvent(
-                        kind="status",
-                        message=f"{prefix}{platform} 정보 분석 중...",
+                try:
+                    self._emit(
+                        "status",
+                        f"{prefix}{platform} 정보 분석 중...",
                         percent=((url_idx - 1) + 0.05) / total_urls,
                     )
-                )
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if info and not current_title:
-                        current_title = str(info.get("title", ""))
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        if info and not current_title:
+                            current_title = str(info.get("title", ""))
 
-                if cancel_event.is_set():
-                    emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
-                    return
+                    if self._is_cancelled():
+                        self._emit("cancelled", "작업이 취소되었습니다.")
+                        return
 
-                produced = sorted(tmp_dir.glob(f"*.{fmt}"))
-                for audio_file in produced:
-                    if need_trim:
-                        emit(
-                            ProgressEvent(
-                                kind="status",
-                                message=f"{prefix}구간 자르기 처리 중...",
+                    produced = sorted(tmp_dir.glob(f"*.{fmt}"))
+                    for audio_file in produced:
+                        if need_trim:
+                            self._emit(
+                                "status",
+                                f"{prefix}구간 자르기 처리 중...",
                                 percent=((url_idx - 1) + 0.95) / total_urls,
                                 title=audio_file.stem,
                             )
+                            _trim_audio_file(ffmpeg_dir, audio_file, start_sec, end_sec)
+
+                        safe_stem = _sanitize_filename(audio_file.stem)
+                        dest = _unique_path(
+                            options.output_dir / f"{safe_stem}({quality_tag}).{fmt}"
                         )
-                        _trim_audio_file(ffmpeg_dir, audio_file, start_sec, end_sec)
+                        shutil.move(str(audio_file), str(dest))
+                        saved_count += 1
+                        last_title = current_title or audio_file.stem
 
-                    safe_stem = _sanitize_filename(audio_file.stem)
-                    dest = _unique_path(
-                        options.output_dir / f"{safe_stem}({quality_tag}).{fmt}"
-                    )
-                    shutil.move(str(audio_file), str(dest))
-                    saved_count += 1
+                except DownloadCancelled:
+                    self._emit("cancelled", "작업이 취소되었습니다.")
+                    return
+                except yt_dlp.utils.DownloadError as exc:
+                    self._emit("error", f"{prefix}다운로드 오류: {exc}")
+                    return
+                except Exception as exc:
+                    self._emit("error", f"{prefix}오류: {exc}")
+                    return
 
-            except DownloadCancelled:
-                emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
-                return
-            except yt_dlp.utils.DownloadError as exc:
-                emit(ProgressEvent(kind="error", message=f"{prefix}다운로드 오류: {exc}"))
-                return
-            except Exception as exc:
-                emit(ProgressEvent(kind="error", message=f"{prefix}오류: {exc}"))
-                return
-
-    emit(
-        ProgressEvent(
-            kind="done",
-            message=f"총 {saved_count}개 {fmt.upper()} 파일 저장 완료!",
+        self._emit(
+            "done",
+            f"총 {saved_count}개 {fmt.upper()} 파일 저장 완료!",
             percent=1.0,
-            title=current_title,
+            title=last_title,
         )
-    )
+
+
+def convert_to_mp3(
+    options: ConversionOptions,
+    emit: Callable[[ProgressEvent], None],
+    cancel_event: threading.Event,
+) -> None:
+    """Compatibility wrapper delegating to AudioExtractor."""
+    AudioExtractor(emit, cancel_event).run(options)
 
 
 def _download_image_bytes(url: str) -> Optional[bytes]:
@@ -535,125 +575,118 @@ def _pick_thumbnail_candidates(entry: dict, platform: str, quality: str) -> list
     return candidates
 
 
+class ThumbnailExtractor(BaseMediaProcessor):
+    """Extracts and saves thumbnail/artwork images as '<title>(<WxH>).jpg'."""
+
+    def run(self, options: ThumbnailOptions) -> None:
+        """Execute thumbnail extraction for one or more URLs."""
+        urls = self._validate_urls(options.urls)
+        if urls is None:
+            return
+
+        options.output_dir.mkdir(parents=True, exist_ok=True)
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": not options.allow_playlist,
+            "skip_download": True,
+        }
+
+        total_urls = len(urls)
+        saved_count = 0
+        last_title = ""
+
+        try:
+            for url_idx, url in enumerate(urls, start=1):
+                if self._is_cancelled():
+                    self._emit("cancelled", "작업이 취소되었습니다.")
+                    return
+
+                platform = detect_platform(url)
+                prefix = f"[{url_idx}/{total_urls}] " if total_urls > 1 else ""
+                self._emit(
+                    "status",
+                    f"{prefix}{platform} 썸네일 정보 분석 중...",
+                    percent=(url_idx - 0.8) / total_urls,
+                )
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+
+                if not info:
+                    continue
+
+                entries = (
+                    list(info["entries"])
+                    if "entries" in info and info["entries"]
+                    else [info]
+                )
+                entries = [e for e in entries if e]
+                total_entries = len(entries)
+
+                for idx, entry in enumerate(entries, start=1):
+                    if self._is_cancelled():
+                        self._emit("cancelled", "작업이 취소되었습니다.")
+                        return
+
+                    title = str(entry.get("title") or f"thumbnail_{idx}")
+                    last_title = title
+                    safe_title = _sanitize_filename(title)
+                    candidates = _pick_thumbnail_candidates(
+                        entry, platform, options.quality
+                    )
+
+                    self._emit(
+                        "progress",
+                        f"{prefix}썸네일 다운로드 중... ({idx}/{total_entries})",
+                        percent=((url_idx - 1) + (idx / max(total_entries, 1)))
+                        / total_urls,
+                        title=title,
+                    )
+
+                    raw_bytes: Optional[bytes] = None
+                    for cand_url in candidates:
+                        if self._is_cancelled():
+                            self._emit("cancelled", "작업이 취소되었습니다.")
+                            return
+                        raw_bytes = _download_image_bytes(cand_url)
+                        if raw_bytes:
+                            break
+
+                    if not raw_bytes:
+                        continue
+
+                    with Image.open(io.BytesIO(raw_bytes)) as img:
+                        rgb_img = img.convert("RGB")
+                        width, height = rgb_img.size
+                        out_path = _unique_path(
+                            options.output_dir / f"{safe_title}({width}x{height}).jpg"
+                        )
+                        rgb_img.save(out_path, format="JPEG", quality=95)
+                        saved_count += 1
+
+            if saved_count == 0:
+                self._emit("error", "선택한 화질의 썸네일을 찾을 수 없습니다.")
+                return
+
+            self._emit(
+                "done",
+                f"썸네일 {saved_count}개 저장 완료!",
+                percent=1.0,
+                title=last_title,
+            )
+        except yt_dlp.utils.DownloadError as exc:
+            self._emit("error", f"추출 오류: {exc}")
+        except Exception as exc:
+            self._emit("error", f"예기치 않은 오류: {exc}")
+
+
 def extract_thumbnail(
     options: ThumbnailOptions,
     emit: Callable[[ProgressEvent], None],
     cancel_event: threading.Event,
 ) -> None:
-    """Extract and save thumbnail image(s) as '<title>(<WxH>).jpg' with duplicate safety."""
-    urls = [u.strip() for u in options.urls if u.strip()]
-    if not urls:
-        emit(ProgressEvent(kind="error", message="URL을 하나 이상 입력해 주세요."))
-        return
-
-    invalid = [u for u in urls if not detect_platform(u)]
-    if invalid:
-        emit(
-            ProgressEvent(
-                kind="error",
-                message=f"지원하지 않는 URL이 있습니다: {invalid[0]}",
-            )
-        )
-        return
-
-    options.output_dir.mkdir(parents=True, exist_ok=True)
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": not options.allow_playlist,
-        "skip_download": True,
-    }
-
-    total_urls = len(urls)
-    saved_count = 0
-    last_title = ""
-
-    try:
-        for url_idx, url in enumerate(urls, start=1):
-            if cancel_event.is_set():
-                emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
-                return
-
-            platform = detect_platform(url)
-            prefix = f"[{url_idx}/{total_urls}] " if total_urls > 1 else ""
-            emit(
-                ProgressEvent(
-                    kind="status",
-                    message=f"{prefix}{platform} 썸네일 정보 분석 중...",
-                    percent=(url_idx - 0.8) / total_urls,
-                )
-            )
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-
-            if not info:
-                continue
-
-            entries = list(info["entries"]) if "entries" in info and info["entries"] else [info]
-            entries = [e for e in entries if e]
-            total_entries = len(entries)
-
-            for idx, entry in enumerate(entries, start=1):
-                if cancel_event.is_set():
-                    emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
-                    return
-
-                title = str(entry.get("title") or f"thumbnail_{idx}")
-                last_title = title
-                safe_title = _sanitize_filename(title)
-                candidates = _pick_thumbnail_candidates(entry, platform, options.quality)
-
-                emit(
-                    ProgressEvent(
-                        kind="progress",
-                        message=f"{prefix}썸네일 다운로드 중... ({idx}/{total_entries})",
-                        percent=((url_idx - 1) + (idx / max(total_entries, 1))) / total_urls,
-                        title=title,
-                    )
-                )
-
-                raw_bytes: Optional[bytes] = None
-                for cand_url in candidates:
-                    if cancel_event.is_set():
-                        emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
-                        return
-                    raw_bytes = _download_image_bytes(cand_url)
-                    if raw_bytes:
-                        break
-
-                if not raw_bytes:
-                    continue
-
-                with Image.open(io.BytesIO(raw_bytes)) as img:
-                    rgb_img = img.convert("RGB")
-                    width, height = rgb_img.size
-                    out_path = _unique_path(
-                        options.output_dir / f"{safe_title}({width}x{height}).jpg"
-                    )
-                    rgb_img.save(out_path, format="JPEG", quality=95)
-                    saved_count += 1
-
-        if saved_count == 0:
-            emit(
-                ProgressEvent(
-                    kind="error",
-                    message="선택한 화질의 썸네일을 찾을 수 없습니다.",
-                )
-            )
-            return
-
-        emit(
-            ProgressEvent(
-                kind="done",
-                message=f"썸네일 {saved_count}개 저장 완료!",
-                percent=1.0,
-                title=last_title,
-            )
-        )
-    except yt_dlp.utils.DownloadError as exc:
-        emit(ProgressEvent(kind="error", message=f"추출 오류: {exc}"))
-    except Exception as exc:
-        emit(ProgressEvent(kind="error", message=f"예기치 않은 오류: {exc}"))
+    """Compatibility wrapper delegating to ThumbnailExtractor."""
+    ThumbnailExtractor(emit, cancel_event).run(options)
 
 
 @dataclass(frozen=True)
@@ -667,87 +700,80 @@ class LocalCutOptions:
     max_duration: Optional[float] = None
 
 
+class AudioTrimmer(BaseMediaProcessor):
+    """Trims existing local audio files with millisecond precision."""
+
+    def run(self, options: LocalCutOptions) -> None:
+        """Trim an existing local audio file according to options."""
+        src = options.source_file
+        if not src.is_file():
+            self._emit("error", "존재하는 오디오 파일을 선택해 주세요.")
+            return
+
+        ffmpeg_dir = self._require_ffmpeg()
+        if ffmpeg_dir is None:
+            return
+
+        try:
+            start_sec = parse_time_to_seconds(options.start_time)
+            end_sec = parse_time_to_seconds(options.end_time)
+        except ValueError as exc:
+            self._emit("error", str(exc))
+            return
+
+        if start_sec is None and end_sec is None:
+            self._emit("error", "시작 또는 종료 시간을 입력해 주세요.")
+            return
+
+        duration = (
+            options.max_duration
+            if options.max_duration is not None
+            else get_audio_duration(src)
+        )
+        if duration is not None:
+            if start_sec is not None and start_sec >= duration:
+                self._emit(
+                    "error",
+                    f"시작 시간이 전체 길이({format_seconds_ms(duration)})를 초과했습니다.",
+                )
+                return
+            if end_sec is not None and end_sec > duration + 0.001:
+                self._emit(
+                    "error",
+                    f"종료 시간이 전체 길이({format_seconds_ms(duration)})를 초과했습니다.",
+                )
+                return
+
+        if start_sec is not None and end_sec is not None and start_sec >= end_sec:
+            self._emit("error", "종료 시간은 시작 시간보다 커야 합니다.")
+            return
+
+        if self._is_cancelled():
+            self._emit("cancelled", "작업이 취소되었습니다.")
+            return
+
+        options.output_dir.mkdir(parents=True, exist_ok=True)
+        safe_stem = _sanitize_filename(src.stem)
+        dest = _unique_path(options.output_dir / f"{safe_stem}(cut){src.suffix}")
+
+        self._emit("status", "오디오 구간 자르는 중...", percent=0.4, title=src.name)
+
+        try:
+            _run_ffmpeg_trim(ffmpeg_dir, src, dest, start_sec, end_sec)
+            self._emit(
+                "done",
+                f"오디오 자르기 완료: {dest.name}",
+                percent=1.0,
+                title=dest.name,
+            )
+        except Exception as exc:
+            self._emit("error", f"자르기 실패: {exc}")
+
+
 def cut_local_audio(
     options: LocalCutOptions,
     emit: Callable[[ProgressEvent], None],
     cancel_event: threading.Event,
 ) -> None:
-    """Trim an existing local audio file with millisecond precision."""
-    src = options.source_file
-    if not src.is_file():
-        emit(ProgressEvent(kind="error", message="존재하는 오디오 파일을 선택해 주세요."))
-        return
-
-    ffmpeg_dir = find_ffmpeg_dir()
-    if ffmpeg_dir is None:
-        emit(
-            ProgressEvent(
-                kind="error",
-                message="FFmpeg을 찾을 수 없습니다. bin 폴더 또는 시스템 PATH를 확인해 주세요.",
-            )
-        )
-        return
-
-    try:
-        start_sec = parse_time_to_seconds(options.start_time)
-        end_sec = parse_time_to_seconds(options.end_time)
-    except ValueError as exc:
-        emit(ProgressEvent(kind="error", message=str(exc)))
-        return
-
-    if start_sec is None and end_sec is None:
-        emit(ProgressEvent(kind="error", message="시작 또는 종료 시간을 입력해 주세요."))
-        return
-
-    duration = options.max_duration if options.max_duration is not None else get_audio_duration(src)
-    if duration is not None:
-        if start_sec is not None and start_sec >= duration:
-            emit(
-                ProgressEvent(
-                    kind="error",
-                    message=f"시작 시간이 전체 길이({format_seconds_ms(duration)})를 초과했습니다.",
-                )
-            )
-            return
-        if end_sec is not None and end_sec > duration + 0.001:
-            emit(
-                ProgressEvent(
-                    kind="error",
-                    message=f"종료 시간이 전체 길이({format_seconds_ms(duration)})를 초과했습니다.",
-                )
-            )
-            return
-
-    if start_sec is not None and end_sec is not None and start_sec >= end_sec:
-        emit(ProgressEvent(kind="error", message="종료 시간은 시작 시간보다 커야 합니다."))
-        return
-
-    if cancel_event.is_set():
-        emit(ProgressEvent(kind="cancelled", message="작업이 취소되었습니다."))
-        return
-
-    options.output_dir.mkdir(parents=True, exist_ok=True)
-    safe_stem = _sanitize_filename(src.stem)
-    dest = _unique_path(options.output_dir / f"{safe_stem}(cut){src.suffix}")
-
-    emit(
-        ProgressEvent(
-            kind="status",
-            message="오디오 구간 자르는 중...",
-            percent=0.4,
-            title=src.name,
-        )
-    )
-
-    try:
-        _run_ffmpeg_trim(ffmpeg_dir, src, dest, start_sec, end_sec)
-        emit(
-            ProgressEvent(
-                kind="done",
-                message=f"오디오 자르기 완료: {dest.name}",
-                percent=1.0,
-                title=dest.name,
-            )
-        )
-    except Exception as exc:
-        emit(ProgressEvent(kind="error", message=f"자르기 실패: {exc}"))
+    """Compatibility wrapper delegating to AudioTrimmer."""
+    AudioTrimmer(emit, cancel_event).run(options)
